@@ -141,6 +141,12 @@ func (it *indexBuildTask) setJobInfo(result *workerpb.IndexTaskInfo) error {
 		}
 	}
 
+	if result.GetState() == commonpb.IndexState_Finished && result.GetManifestPath() != "" {
+		if err := it.meta.UpdateSegmentsInfo(it.meta.ctx, UpdateManifestPathForIndex(it.SegmentID, result.GetManifestPath())); err != nil {
+			return merr.Wrap(err, "failed to persist index manifest version")
+		}
+	}
+
 	if err := it.meta.indexMeta.FinishTask(result); err != nil {
 		return err
 	}
@@ -150,8 +156,8 @@ func (it *indexBuildTask) setJobInfo(result *workerpb.IndexTaskInfo) error {
 		// The build result is durable at this point. Do not leave the task
 		// running if the independent segment-stats write fails; startup
 		// reconciliation will repair a missed update.
-		if err := it.meta.syncVectorIndexSizeLocked(context.TODO(), it.CollectionID, it.SegmentID); err != nil {
-			mlog.Warn(context.TODO(), "failed to update vector index size after index build completion",
+		if err := it.meta.syncVectorIndexSizeLocked(it.meta.ctx, it.CollectionID, it.SegmentID); err != nil {
+			mlog.Warn(it.meta.ctx, "failed to update vector index size after index build completion",
 				mlog.FieldSegmentID(it.SegmentID), mlog.FieldIndexID(it.IndexID), mlog.Err(err))
 		}
 	}
@@ -554,6 +560,8 @@ func (it *indexBuildTask) prepareJobRequest(ctx context.Context, segment *Segmen
 		ClusterID:                 Params.CommonCfg.ClusterPrefix.GetValue(),
 		IndexFilePrefix:           path.Join(it.chunkManager.RootPath(), common.SegmentIndexV0Path),
 		BuildID:                   it.BuildID,
+		IndexID:                   it.IndexID,
+		IndexName:                 it.meta.indexMeta.GetIndexNameByID(segIndex.CollectionID, segIndex.IndexID),
 		IndexStorePathVersion:     segIndex.IndexStorePathVersion,
 		IndexVersion:              segIndex.IndexVersion + 1,
 		StorageConfig:             createStorageConfig(),
@@ -652,7 +660,15 @@ func (it *indexBuildTask) QueryTaskOnWorker(cluster session.Cluster) {
 				log.Info(ctx, "query task index info successfully",
 					mlog.Int64("taskID", it.BuildID), mlog.String("result state", info.GetState().String()),
 					mlog.String("failReason", info.GetFailReason()))
-				it.setJobInfo(info)
+				if err := it.setJobInfo(info); err != nil {
+					log.Warn(ctx, "failed to persist index task result", mlog.Err(err))
+					// The worker publishes index metadata only against the manifest it
+					// built from. If a different manifest was adopted before DataCoord
+					// observed the result, discard this worker result and rebuild.
+					if errors.Is(err, errIndexManifestPublicationStale) {
+						it.dropAndResetTaskOnWorker(cluster, "index manifest changed before index result was persisted")
+					}
+				}
 			case commonpb.IndexState_Retry, commonpb.IndexState_IndexStateNone:
 				log.Info(ctx, "query task index info successfully",
 					mlog.Int64("taskID", it.BuildID), mlog.String("result state", info.GetState().String()),
