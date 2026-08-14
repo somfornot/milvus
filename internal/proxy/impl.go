@@ -159,15 +159,27 @@ func (node *Proxy) InvalidateCollectionMetaCache(ctx context.Context, request *p
 	switch msgType {
 	case commonpb.MsgType_CreateRowPolicy,
 		commonpb.MsgType_UpdateRowPolicy,
-		commonpb.MsgType_DropRowPolicy,
-		commonpb.MsgType_SetRLSPrincipalTags,
-		commonpb.MsgType_DeleteRLSPrincipalTags:
-		rls.RemoveCollection(ctx, collectionID)
-		mlog.Info(ctx, "complete to invalidate RLS snapshots",
+		commonpb.MsgType_DropRowPolicy:
+		rls.RemovePolicyCollection(ctx, collectionID)
+		mlog.Info(ctx, "complete to invalidate RLS policy snapshot",
 			mlog.String("type", request.GetBase().GetMsgType().String()),
 			mlog.FieldDbName(dbName),
 			mlog.FieldCollectionName(collectionName),
 			mlog.FieldCollectionID(collectionID))
+		return merr.Success(), nil
+	case commonpb.MsgType_SetRLSPrincipalTags,
+		commonpb.MsgType_DeleteRLSPrincipalTags:
+		principalName := request.GetBase().GetProperties()[common.RLSPrincipalNameKey]
+		if principalName == "" {
+			return merr.Status(merr.WrapErrServiceInternalMsg("RLS principal cache invalidation is missing principal name")), nil
+		}
+		rls.RemovePrincipal(ctx, collectionID, principalName)
+		mlog.Info(ctx, "complete to invalidate RLS principal tags",
+			mlog.String("type", request.GetBase().GetMsgType().String()),
+			mlog.FieldDbName(dbName),
+			mlog.FieldCollectionName(collectionName),
+			mlog.FieldCollectionID(collectionID),
+			mlog.String("principalName", principalName))
 		return merr.Success(), nil
 	}
 
@@ -231,6 +243,9 @@ func (node *Proxy) InvalidateCollectionMetaCache(ctx context.Context, request *p
 			aliasName = globalMetaCache.InvalidateCollectionMeta(ctx, request.GetDbName(), collectionName, collectionID, false)
 			deprecateShardCaches(append(aliasName, collectionName)...)
 		}
+	}
+	if msgType == commonpb.MsgType_DropDatabase {
+		rls.RemoveDatabase(ctx, request.GetDbName())
 	}
 
 	switch msgType {
@@ -6838,7 +6853,11 @@ func (node *Proxy) SetRLSPrincipalTags(ctx context.Context, req *milvuspb.SetRLS
 	if err := rlsutil.ValidatePrincipalName(req.GetPrincipalName()); err != nil {
 		return merr.Status(err), nil
 	}
-	if err := rlsutil.ValidateTags(req.GetTags()); err != nil {
+	tags, err := rlsutil.TagsFromJSON(req.GetTags())
+	if err != nil {
+		return merr.Status(err), nil
+	}
+	if err := rlsutil.ValidateTags(tags); err != nil {
 		return merr.Status(err), nil
 	}
 	prepareRLSMsgBase(&req.Base, commonpb.MsgType_SetRLSPrincipalTags)

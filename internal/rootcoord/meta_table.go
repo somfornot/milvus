@@ -172,9 +172,9 @@ type IMetaTable interface {
 	PrepareDeleteRLSPrincipalTags(ctx context.Context, req *rlsutil.DeleteRLSPrincipalTagsRequest) (*model.RLSPrincipal, bool, error)
 	ApplyAlterRLSPrincipal(ctx context.Context, principal *model.RLSPrincipal) error
 	ApplyDropRLSPrincipal(ctx context.Context, collectionID int64, principalName string) error
-	GetRLSPrincipalTags(ctx context.Context, req *rlsutil.GetRLSPrincipalTagsRequest) (map[string]string, error)
+	GetRLSPrincipalTags(ctx context.Context, req *rlsutil.GetRLSPrincipalTagsRequest) (map[string]rlsutil.TagValue, error)
 	ListRLSPrincipals(ctx context.Context, req *rlsutil.ListRLSPrincipalsRequest) ([]string, error)
-	GetRLSMetadata(ctx context.Context, collectionID int64, kind rootcoordpb.RLSMetadataKind) (*model.RLSMetadata, error)
+	GetRLSMetadata(ctx context.Context, collectionID int64, kind rootcoordpb.RLSMetadataKind, principalName string) (*model.RLSMetadata, error)
 
 	AddFileResource(ctx context.Context, resource *internalpb.FileResourceInfo) error
 	RemoveFileResource(ctx context.Context, name string) (error, bool)
@@ -3009,8 +3009,8 @@ func validateRLSUnaryRangeExpr(expr *planpb.UnaryRangeExpr, allowedTemplateVaria
 	if err := validateRLSScalarColumn(expr.GetColumnInfo()); err != nil {
 		return err
 	}
-	if expr.GetTemplateVariableName() != "" && !typeutil.IsStringType(expr.GetColumnInfo().GetDataType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS principal variables can only be compared with string fields")
+	if expr.GetTemplateVariableName() == funcutil.RLSPrincipalTemplateName && !typeutil.IsStringType(expr.GetColumnInfo().GetDataType()) {
+		return merr.WrapErrParameterInvalidMsg("RLS current principal can only be compared with string fields")
 	}
 	return nil
 }
@@ -3051,8 +3051,8 @@ func validateRLSJSONContainsExpr(expr *planpb.JSONContainsExpr, allowedTemplateV
 	default:
 		return merr.WrapErrParameterInvalidMsg("unsupported RLS array_contains operator %s", expr.GetOp().String())
 	}
-	if expr.GetTemplateVariableName() != "" && !typeutil.IsStringType(column.GetElementType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS principal variables can only be compared with string array fields")
+	if expr.GetTemplateVariableName() == funcutil.RLSPrincipalTemplateName && !typeutil.IsStringType(column.GetElementType()) {
+		return merr.WrapErrParameterInvalidMsg("RLS current principal can only be compared with string array fields")
 	}
 	return nil
 }
@@ -3281,7 +3281,7 @@ func (mt *MetaTable) ListRLSPolicies(ctx context.Context, req *rlsutil.ListRowPo
 	return policies, nil
 }
 
-func (mt *MetaTable) GetRLSMetadata(ctx context.Context, collectionID int64, kind rootcoordpb.RLSMetadataKind) (*model.RLSMetadata, error) {
+func (mt *MetaTable) GetRLSMetadata(ctx context.Context, collectionID int64, kind rootcoordpb.RLSMetadataKind, principalName string) (*model.RLSMetadata, error) {
 	if collectionID == 0 {
 		return nil, merr.WrapErrServiceInternalMsg("failed to get RLS metadata with empty collection id")
 	}
@@ -3309,12 +3309,27 @@ func (mt *MetaTable) GetRLSMetadata(ctx context.Context, collectionID int64, kin
 	}
 	switch kind {
 	case rootcoordpb.RLSMetadataKind_RLS_METADATA_KIND_ALL:
+		if principalName != "" {
+			return nil, merr.WrapErrServiceInternalMsg("RLS principal filter is only supported for principal metadata")
+		}
 		metadata.Policies = model.CloneRLSPolicies(coll.RLSPolicies)
 		metadata.Principals = model.CloneRLSPrincipals(coll.RLSPrincipals)
 	case rootcoordpb.RLSMetadataKind_RLS_METADATA_KIND_POLICIES:
+		if principalName != "" {
+			return nil, merr.WrapErrServiceInternalMsg("RLS principal filter is only supported for principal metadata")
+		}
 		metadata.Policies = model.CloneRLSPolicies(coll.RLSPolicies)
 	case rootcoordpb.RLSMetadataKind_RLS_METADATA_KIND_PRINCIPALS:
-		metadata.Principals = model.CloneRLSPrincipals(coll.RLSPrincipals)
+		if principalName == "" {
+			metadata.Principals = model.CloneRLSPrincipals(coll.RLSPrincipals)
+			break
+		}
+		for _, principal := range coll.RLSPrincipals {
+			if principal.PrincipalName == principalName {
+				metadata.Principals = []*model.RLSPrincipal{model.CloneRLSPrincipal(principal)}
+				break
+			}
+		}
 	default:
 		return nil, merr.WrapErrServiceInternalMsg("unsupported RLS metadata kind %s", kind.String())
 	}
@@ -3334,18 +3349,22 @@ func validateRLSTagKey(tagKey string) error {
 }
 
 func validateRLSTags(tags map[string]string) error {
-	return rlsutil.ValidateTags(tags)
+	typed := make(map[string]rlsutil.TagValue, len(tags))
+	for key, value := range tags {
+		typed[key] = rlsutil.NewStringTagValue(value)
+	}
+	return rlsutil.ValidateTags(typed)
 }
 
 func validateAndDeduplicateRLSTagKeys(tagKeys []string) ([]string, error) {
 	return rlsutil.ValidateAndDeduplicateTagKeys(tagKeys)
 }
 
-func cloneRLSTags(tags map[string]string) map[string]string {
+func cloneRLSTags(tags map[string]rlsutil.TagValue) map[string]rlsutil.TagValue {
 	if tags == nil {
 		return nil
 	}
-	cloned := make(map[string]string, len(tags))
+	cloned := make(map[string]rlsutil.TagValue, len(tags))
 	for key, value := range tags {
 		cloned[key] = value
 	}
@@ -3359,7 +3378,8 @@ func (mt *MetaTable) PrepareSetRLSPrincipalTags(ctx context.Context, req *rlsuti
 	if err := validateRLSPrincipalName(req.GetPrincipalName()); err != nil {
 		return nil, err
 	}
-	if err := validateRLSTags(req.GetTags()); err != nil {
+	tags := req.GetTags()
+	if err := rlsutil.ValidateTags(tags); err != nil {
 		return nil, err
 	}
 
@@ -3369,7 +3389,9 @@ func (mt *MetaTable) PrepareSetRLSPrincipalTags(ctx context.Context, req *rlsuti
 	}
 
 	_, err = mt.catalog.GetRLSPrincipal(ctx, coll.CollectionID, req.GetPrincipalName())
+	isNew := false
 	if errors.Is(err, merr.ErrIoKeyNotFound) {
+		isNew = true
 		if err := validateRLSPrincipalNameForSet(req.GetPrincipalName()); err != nil {
 			return nil, err
 		}
@@ -3384,12 +3406,13 @@ func (mt *MetaTable) PrepareSetRLSPrincipalTags(ctx context.Context, req *rlsuti
 		DBID:          coll.DBID,
 		CollectionID:  coll.CollectionID,
 		PrincipalName: req.GetPrincipalName(),
-		Tags:          cloneRLSTags(req.GetTags()),
+		Tags:          cloneRLSTags(tags),
+		IsNew:         isNew,
 	}
 	return principal, nil
 }
 
-func (mt *MetaTable) GetRLSPrincipalTags(ctx context.Context, req *rlsutil.GetRLSPrincipalTagsRequest) (map[string]string, error) {
+func (mt *MetaTable) GetRLSPrincipalTags(ctx context.Context, req *rlsutil.GetRLSPrincipalTagsRequest) (map[string]rlsutil.TagValue, error) {
 	if req == nil {
 		return nil, merr.WrapErrParameterInvalidMsg("get RLS principal tags request is nil")
 	}
